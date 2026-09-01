@@ -9,10 +9,10 @@ use roslibrust_common::*;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio::time::Duration;
+use tokio::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
 
 use super::{
@@ -25,6 +25,7 @@ use super::{
 pub struct ClientHandleOptions {
     url: String,
     timeout: Option<Duration>,
+    name: Option<String>,
 }
 
 impl ClientHandleOptions {
@@ -33,7 +34,21 @@ impl ClientHandleOptions {
         ClientHandleOptions {
             url: url.into(),
             timeout: None,
+            name: None,
         }
+    }
+
+    /// Names this connection in the log.
+    /// Applications routinely hold several clients pointed at the same url, and without
+    /// a name there is no way to tell their connection and reconnection messages apart.
+    ///
+    /// ```no_run
+    /// # use roslibrust_rosbridge::ClientHandleOptions;
+    /// let opts = ClientHandleOptions::new("ws://localhost:9090").name("services");
+    /// ```
+    pub fn name<S: Into<String>>(mut self, name: S) -> ClientHandleOptions {
+        self.name = Some(name.into());
+        self
     }
 
     /// Configures a default timeout for all operations.
@@ -90,11 +105,16 @@ impl ClientHandle {
         // We connect when we create Client
         let is_disconnected = Arc::new(AtomicBool::new(false));
 
+        // Copy out the connection's label so the spin task can tag its logs without
+        // having to take the client lock
+        let label = inner.read().await.label.clone();
+
         // Spawn the spin task
         // The internal stubborn spin task continues to try to reconnect on failure
         drop(tokio::task::spawn(stubborn_spin(
             inner_weak,
             is_disconnected.clone(),
+            label,
         )));
 
         Ok(ClientHandle {
@@ -110,10 +130,31 @@ impl ClientHandle {
         Self::new_with_options(ClientHandleOptions::new(url)).await
     }
 
+    /// Reports whether the client currently has a live connection to rosbridge.
+    ///
+    /// This is a snapshot and can change at any moment: a background task pings the
+    /// server and rebuilds the socket when it stops answering, so a connection can drop
+    /// and be restored without any call being made. Operations that return
+    /// [Error::Disconnected] were refused because this was false at the time.
+    ///
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ///   let handle = roslibrust_rosbridge::ClientHandle::new("ws://localhost:9090").await?;
+    ///   if !handle.is_connected() {
+    ///     println!("rosbridge connection is down, reconnecting in the background");
+    ///   }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn is_connected(&self) -> bool {
+        !self.is_disconnected.load(Ordering::Relaxed)
+    }
+
     fn check_for_disconnect(&self) -> Result<()> {
-        match self.is_disconnected.load(Ordering::Relaxed) {
-            false => Ok(()),
-            true => Err(Error::Disconnected),
+        match self.is_connected() {
+            true => Ok(()),
+            false => Err(Error::Disconnected),
         }
     }
 
@@ -569,8 +610,48 @@ impl ClientHandle {
     }
 }
 
+/// How often a websocket ping is sent to prove the connection is still round-tripping
+const PING_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long the server may go without answering a ping before we throw the socket
+/// away and build a new one
+const PONG_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Distinguishes the log messages of multiple concurrent connections
+static NEXT_CLIENT_ID: AtomicUsize = AtomicUsize::new(0);
+
+/// Builds the prefix that every connection level log message carries.
+/// The caller supplied name is what makes two sockets to the same url tellable apart,
+/// and the id keeps even identically named connections distinct.
+fn connection_label(opts: &ClientHandleOptions) -> String {
+    let id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
+    match &opts.name {
+        Some(name) => format!("{name} {} #{id}", opts.url),
+        None => format!("{} #{id}", opts.url),
+    }
+}
+
+/// Tracks the websocket ping / pong exchange for a single connection
+struct Heartbeat {
+    last_ping_sent: Instant,
+    last_pong_received: Instant,
+}
+
+impl Heartbeat {
+    /// Starts the deadline fresh, called whenever a new socket is established
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            last_ping_sent: now,
+            last_pong_received: now,
+        }
+    }
+}
+
 /// A client connection to the rosbridge_server that allows for publishing and subscribing to topics
 pub(crate) struct Client {
+    /// Identifies this connection in the log, an application may hold several
+    label: String,
     reader: RwLock<Reader>,
     writer: RwLock<Writer>,
     // Stores a record of the publishers we've handed out
@@ -580,20 +661,24 @@ pub(crate) struct Client {
     // Contains any outstanding service calls we're waiting for a response on
     // Map key will be a uniquely generated id for each call
     service_calls: Arc<DashMap<String, tokio::sync::oneshot::Sender<Value>>>,
+    heartbeat: std::sync::Mutex<Heartbeat>,
     opts: ClientHandleOptions,
 }
 
 impl Client {
     // internal implementation of new
     async fn new(opts: ClientHandleOptions) -> Result<Self> {
-        let (writer, reader) = stubborn_connect(&opts.url).await;
+        let label = connection_label(&opts);
+        let (writer, reader) = stubborn_connect(&label, &opts.url).await;
         let client = Self {
+            label,
             reader: RwLock::new(reader),
             writer: RwLock::new(writer),
             publishers: DashMap::new(),
             services: DashMap::new(),
             subscriptions: DashMap::new(),
             service_calls: Arc::new(DashMap::new()),
+            heartbeat: std::sync::Mutex::new(Heartbeat::new()),
             opts,
         };
 
@@ -652,6 +737,7 @@ impl Client {
             }
             Message::Pong(pong) => {
                 debug!("Pong received {:?}", pong);
+                self.heartbeat().last_pong_received = Instant::now();
             }
             _ => {
                 warn!("Unexpected non-text response received, ignoring...");
@@ -730,6 +816,48 @@ impl Client {
         }
     }
 
+    fn heartbeat(&self) -> std::sync::MutexGuard<'_, Heartbeat> {
+        // The guarded data is two timestamps and nothing can panic while the lock
+        // is held, so a poisoned lock is not a state we can actually reach
+        self.heartbeat.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Sends a ping on an interval and reports an error once the server has stopped
+    /// answering them.
+    ///
+    /// A websocket that dies without a close frame (a pulled cable, a NAT timeout, a
+    /// peer losing power) leaves reads pending forever and writes apparently succeeding,
+    /// so this round trip is the only thing that can detect it.
+    async fn check_heartbeat(&self) -> Result<()> {
+        let now = Instant::now();
+        let (last_ping_sent, last_pong_received) = {
+            let heartbeat = self.heartbeat();
+            (heartbeat.last_ping_sent, heartbeat.last_pong_received)
+        };
+
+        if now.duration_since(last_pong_received) > PONG_TIMEOUT {
+            return Err(Error::Unexpected(anyhow!(
+                "No pong received in {PONG_TIMEOUT:?}, connection is presumed dead"
+            )));
+        }
+
+        if now.duration_since(last_ping_sent) < PING_INTERVAL {
+            return Ok(());
+        }
+
+        // A ping isn't worth queuing behind an in-flight write, and blocking here would
+        // stall the loop that has to notice the pong timeout. Try again on the next pass.
+        let Ok(mut writer) = self.writer.try_write() else {
+            return Ok(());
+        };
+        self.heartbeat().last_ping_sent = now;
+        // A ping that can't reach the socket within a full interval is itself evidence
+        // that this connection is no longer usable
+        tokio::time::timeout(PING_INTERVAL, writer.ping())
+            .await
+            .map_err(|_| Error::Timeout("Timed out sending websocket ping".to_string()))?
+    }
+
     async fn spin_once(&self) -> Result<()> {
         let read = {
             let mut stream = self.reader.write().await;
@@ -783,9 +911,11 @@ impl Client {
         self.service_calls.clear();
 
         // Reconnect stream
-        let (writer, reader) = stubborn_connect(&self.opts.url).await;
+        let (writer, reader) = stubborn_connect(&self.label, &self.opts.url).await;
         self.reader = RwLock::new(reader);
         self.writer = RwLock::new(writer);
+        // A new socket gets a clean liveness deadline
+        *self.heartbeat() = Heartbeat::new();
 
         // TODO re-establish service servers?
 
@@ -818,8 +948,9 @@ impl Client {
 async fn stubborn_spin(
     client: std::sync::Weak<RwLock<Client>>,
     is_disconnected: Arc<AtomicBool>,
+    label: String,
 ) -> Result<()> {
-    debug!("Starting stubborn_spin");
+    debug!("[{label}] Starting stubborn_spin");
     while let Some(client) = client.upgrade() {
         const SPIN_DURATION: Duration = Duration::from_millis(10);
 
@@ -827,25 +958,27 @@ async fn stubborn_spin(
         let spin_result =
             tokio::time::timeout(SPIN_DURATION, client.read().await.spin_once()).await;
 
-        match spin_result {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                is_disconnected.store(true, Ordering::Relaxed);
-                // Dropping the senders wakes in-flight service calls before we
-                // request the exclusive lock needed to reconnect.
-                client.read().await.service_calls.clear();
-                warn!("Spin failed with error: {err}, attempting to reconnect");
-                // Never propagate a reconnect failure: this task is the only
-                // thing keeping the connection alive, so keep retrying
-                while let Err(e) = client.write().await.reconnect().await {
-                    warn!("Reconnect attempt failed: {e}, retrying");
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
-                is_disconnected.store(false, Ordering::Relaxed);
+        // A spin timeout is normal, it exists so we re-check our weak pointer. Both it
+        // and a successful spin are the moment to keep the ping / pong exchange going:
+        // an idle connection never fails a spin, so nothing else can prove it is alive.
+        let spin_result = match spin_result {
+            Ok(Err(err)) => Err(err),
+            Ok(Ok(())) | Err(_) => client.read().await.check_heartbeat().await,
+        };
+
+        if let Err(err) = spin_result {
+            is_disconnected.store(true, Ordering::Relaxed);
+            // Dropping the senders wakes in-flight service calls before we
+            // request the exclusive lock needed to reconnect.
+            client.read().await.service_calls.clear();
+            warn!("[{label}] Spin failed with error: {err}, attempting to reconnect");
+            // Never propagate a reconnect failure: this task is the only
+            // thing keeping the connection alive, so keep retrying
+            while let Err(e) = client.write().await.reconnect().await {
+                warn!("[{label}] Reconnect attempt failed: {e}, retrying");
+                tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            Err(_) => {
-                // Time out occurred, so we'll check on our weak pointer again
-            }
+            is_disconnected.store(false, Ordering::Relaxed);
         }
     }
 
@@ -869,17 +1002,18 @@ where
 }
 
 // Connects to websocket at specified URL, retries indefinitely
-async fn stubborn_connect(url: &str) -> (Writer, Reader) {
+async fn stubborn_connect(label: &str, url: &str) -> (Writer, Reader) {
     loop {
-        debug!("Starting a stubborn_connect attempt to {url}");
+        debug!("[{label}] Starting a stubborn_connect attempt");
         match connect(url).await {
             Err(e) => {
-                warn!("Failed to reconnect: {:?}", e);
+                warn!("[{label}] Failed to connect: {:?}", e);
                 // TODO configurable rate?
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                 continue;
             }
             Ok(stream) => {
+                info!("[{label}] Connected");
                 let (writer, reader) = stream.split();
                 return (writer, reader);
             }
@@ -968,6 +1102,62 @@ mod tests {
             .await
             .expect("client did not reconnect after the service call was released")
             .unwrap();
+    }
+
+    #[test]
+    fn connection_label_distinguishes_sockets_to_the_same_url() {
+        let url = "ws://localhost:9090";
+        let named = connection_label(&ClientHandleOptions::new(url).name("services"));
+        let unnamed = connection_label(&ClientHandleOptions::new(url));
+
+        assert!(named.starts_with("services "), "{named}");
+        assert!(named.contains(url), "{named}");
+        assert!(unnamed.starts_with(url), "{unnamed}");
+        // Two clients pointed at one url must never share a label
+        assert_ne!(unnamed, connection_label(&ClientHandleOptions::new(url)));
+    }
+
+    #[tokio::test]
+    async fn is_connected_reports_the_connection_state() {
+        let (_listener, client, _websocket) = test_connection(None).await;
+        assert!(client.is_connected());
+
+        // Pins the polarity in both directions, the accessor inverts the stored flag
+        client.is_disconnected.store(true, Ordering::Relaxed);
+        assert!(!client.is_connected());
+    }
+
+    #[tokio::test]
+    async fn socket_that_stops_answering_pings_is_rebuilt() {
+        let (listener, _client, _dead_socket) = test_connection(None).await;
+
+        // _dead_socket is held open but never polled. tungstenite only answers pings
+        // while it is being read, so this is a connection that is alive at the TCP
+        // level and dead at the websocket level, which is the state a pulled cable
+        // leaves behind. Nothing but the pong timeout can detect it.
+        tokio::time::timeout(PONG_TIMEOUT * 2, listener.accept())
+            .await
+            .expect("client did not rebuild the socket after its pings went unanswered")
+            .expect("failed to accept the rebuilt connection");
+    }
+
+    #[tokio::test]
+    async fn socket_answering_pings_is_left_alone() {
+        let (listener, client, mut websocket) = test_connection(None).await;
+
+        // Polling the server side is what makes tungstenite answer our pings. If the
+        // pongs weren't being credited the client would tear this connection down
+        // every PONG_TIMEOUT, so this guards against a healthy connection flapping.
+        let server = tokio::spawn(async move { while websocket.next().await.is_some() {} });
+
+        assert!(
+            tokio::time::timeout(PONG_TIMEOUT * 2, listener.accept())
+                .await
+                .is_err(),
+            "client rebuilt a connection that was answering its pings"
+        );
+        assert!(client.is_connected());
+        server.abort();
     }
 
     #[tokio::test]

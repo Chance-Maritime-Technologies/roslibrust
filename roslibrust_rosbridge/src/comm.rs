@@ -89,6 +89,7 @@ impl FromStr for Ops {
 /// using this trait for mocking. I'm inclined to replace it, and move the
 /// impls directly into some wrapper around [Writer]
 pub(crate) trait RosBridgeComm {
+    async fn ping(&mut self) -> Result<()>;
     async fn subscribe(&mut self, topic: &str, msg_type: &str) -> Result<()>;
     async fn unsubscribe(&mut self, topic: &str) -> Result<()>;
     async fn publish<T: RosMessageType>(&mut self, topic: &str, msg: &T) -> Result<()>;
@@ -113,6 +114,16 @@ pub(crate) trait RosBridgeComm {
 }
 
 impl RosBridgeComm for Writer {
+    /// Sends a websocket ping frame, the server is expected to answer with a pong.
+    /// Not a rosbridge op, this is the websocket level keep-alive used to detect
+    /// a connection that has died without sending a close frame.
+    async fn ping(&mut self) -> Result<()> {
+        let msg = Message::Ping(vec![]);
+        debug!("Sending ping: {:?}", &msg);
+        self.send(msg).await.map_to_roslibrust()?;
+        Ok(())
+    }
+
     async fn subscribe(&mut self, topic: &str, msg_type: &str) -> Result<()> {
         let msg = json!(
         {
